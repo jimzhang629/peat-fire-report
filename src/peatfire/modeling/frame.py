@@ -1,0 +1,592 @@
+"""Build the tidy pixel-year modeling frame.
+
+This is the *assembly layer*. Given a set of analysis **units** (treated
+restoration polygons + matched control polygons -- built upstream by the matching
+step, which is intentionally *not* in this module) and the layers registered in
+:mod:`peatfire.modeling.covariates`, it produces one tidy table:
+
+    one row per (unit-pixel x year), columns
+    [unit_id, site_id, treated, year, x, y, <covariates...>, burned, ...]
+
+ready to hand to :mod:`peatfire.modeling.models`.
+
+Design choices (see ``modeling_notebook_explained.md``, Part V):
+
+* The frame is built on the **same EPSG:5070 common grid** the fire-product
+  comparison uses (:func:`peatfire.build_common_grid`), so no new CRS/area
+  decisions and every layer aligns cell-for-cell.
+* The **response is swappable**: it comes from ``load_standardized(product,
+  year, aoi)``, so switching ``product`` from ``"FireCCIS311"`` to a severity
+  product changes only the ``y`` column, not this builder.
+* **Matching lives upstream.** ``build_frame`` takes an already-assembled
+  ``units`` GeoDataFrame (with ``treated`` and ``site_id`` columns); it does not
+  decide which pixels are controls. That keeps the causal design (who is a
+  control, matched on what) separate and explicit.
+
+:func:`build_mask_frame` is the same assembly with the causal design taken out: it
+tabulates every cell in a plain **area mask** (the NC peat AOI, a county) rather
+than in matched units, for the purely descriptive burned-area-vs-covariate
+pictures in :mod:`peatfire.modeling.plotting`.
+"""
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Iterable, Optional, Sequence
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio.features
+import shapely.geometry
+import xarray as xr
+
+from ..preproc.data_loading import data_path
+from ..fire_products_comparison.fire_comparison import (
+    ANALYSIS_CRS,
+    build_common_grid,
+    rasterize_polygons_to_grid,
+    to_common_grid,
+)
+from ..fire_products_comparison.fire_products import get_spec, load_standardized
+from .covariates import (
+    available_covariates,
+    available_temporal_covariates,
+    covariate_on_grid,
+    temporal_covariate_on_grid,
+)
+
+# FireCCIS311 is ~300 m; default the modeling grid to its native resolution so
+# the response is not needlessly upsampled. Override per call as needed.
+DEFAULT_RES_M = 300.0
+
+
+# ---------------------------------------------------------------------------
+# Treatment layer (restoration sites)
+# ---------------------------------------------------------------------------
+def load_restoration_sites(path: Optional[Path] = None) -> gpd.GeoDataFrame:
+    """Load peat-restoration polygons as a gdf
+    
+    Parameters
+    ----------
+    path : Path
+        Path to the restoration sites shapefile. Has a default location.
+        
+    Returns
+    -------
+    gdf : gpd.GeoDataFrame
+        The loaded restoration sites as a gdf
+    """
+    if path is None:
+        path = data_path(
+            "processed",
+            "peat_restoration",
+            "NC_Pocosin_Restoration_Sites_2026",
+            "NC_Pocosin_Restoration_Sites_2026.shp",
+        )
+        
+    gdf = gpd.read_file(path)
+    
+    return gdf
+
+def load_restoration_sites_in_analysis_crs(path: Optional[Path] = None) -> gpd.GeoDataFrame:
+    """Load peat-restoration polygons as a gdf in ANALYSIS_CRS
+    
+    Parameters
+    ----------
+    path : Path
+        Path to the restoration sites shapefile. Has a default location.
+        
+    Returns
+    -------
+    gdf : gpd.GeoDataFrame
+        The loaded restoration sites as a gdf in ANALYSIS_CRS
+    """
+    gdf = load_restoration_sites(path)
+    gdf = gdf.to_crs(ANALYSIS_CRS)
+    
+    return gdf
+
+def load_completed_restoration_sites_in_analysis_crs(path: Optional[Path] = None, restoration_yr_col: str = 'End_Yr') -> gpd.GeoDataFrame:
+    """Load the completed peatland-restoration polygons, reprojected to the analysis CRS and dropping rows with 0's in the restoration_yr_col.
+    
+    Parameters
+    ----------
+    path : Path
+        Path to the restoration sites shapefile. Has a default location.
+    restoration_yr_col : str
+        The column to treat as the restoration year (i.e., 'Start_Yr' or 'End_Yr'). If a row is 0 in this column, it will be dropped.
+    
+    Returns
+    -------
+    gdf : gpd.GeoDataFrame
+        The gdf with rows marked as 0 in the restoration_yr_col dropped and reprojected to the ANALYSIS_CRS
+    """
+    gdf = load_restoration_sites_in_analysis_crs(path)
+
+    # set the restoration year as the 'End_Yr' rather than the 'Start_Yr' for now, and replace placeholder 0's with nan
+    # some sites have 'Status_202' = 'Completed' but no 'End_Yr' yet. Ask Eric about these, but leave them out for now.
+    gdf[restoration_yr_col] = gdf[restoration_yr_col].replace(0, np.nan)
+    gdf = gdf.dropna(subset=restoration_yr_col)
+    return gdf
+
+# ---------------------------------------------------------------------------
+# Grid <-> unit labelling
+# ---------------------------------------------------------------------------
+def _rasterize_values(
+    gdf: gpd.GeoDataFrame, values: Sequence, grid: xr.DataArray, fill=np.nan
+) -> np.ndarray:
+    """Burn ``values`` (one per feature) onto ``grid``'s cells (all_touched).
+
+    ``all_touched=True`` matches the toolkit's "any sub-cell lights the cell"
+    convention so small units survive the coarse grid. Later features win on
+    overlap -- callers should pass non-overlapping units (treated + matched
+    controls are disjoint by construction).
+    """
+    shapes = zip(gdf.to_crs(grid.rio.crs).geometry, values)
+    return rasterio.features.rasterize(
+        shapes,
+        out_shape=(grid.rio.height, grid.rio.width),
+        transform=grid.rio.transform(),
+        fill=fill,
+        all_touched=True,
+        dtype="float64",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Frame builder
+# ---------------------------------------------------------------------------
+def build_frame(
+    units: gpd.GeoDataFrame,
+    product: str = "FireCCIS311",
+    years: Iterable[int] = range(2019, 2025),
+    covariate_names: Optional[Sequence[str]] = None,
+    temporal_covariate_names: Optional[Sequence[str]] = None,
+    res_m: float = DEFAULT_RES_M,
+    unit_id_col: str = "unit_id",
+    site_id_col: str = "Proj_Name",
+    treated_col: str = "treated",
+) -> pd.DataFrame:
+    """Assemble the tidy pixel-year modeling frame.
+
+    Parameters
+    ----------
+    units : GeoDataFrame
+        Treated restoration polygons + matched control polygons, already chosen
+        upstream. Must carry ``treated`` (1/0), a ``site_id`` (matching stratum),
+        and a per-row ``unit_id``. Reprojected internally to the analysis CRS.
+    product : str
+        Registered fire product supplying the response (default FireCCIS311).
+        Swap for a severity product to model severity instead -- nothing else
+        changes.
+    years : iterable of int
+        Years to stack (FireCCIS311 covers 2019-2024).
+    covariate_names : sequence of str, optional
+        Which registered *static* covariates to attach. Defaults to every covariate
+        whose file is currently on disk (:func:`available_covariates`), so this
+        runs on elevation + histosol % today and picks up the rest as they download.
+    temporal_covariate_names : sequence of str, optional
+        Which registered *per-year* covariates (year-specific weather) to attach,
+        joined on ``(x, y, year)`` so each cell-year gets that year's value -- the
+        columns a ``treated:precip`` dry-year interaction needs. Defaults to
+        :func:`available_temporal_covariates` for ``years`` (every per-year layer
+        present for all requested years).
+    res_m : float
+        Grid resolution in metres (default = FireCCIS311 native ~300 m).
+
+    Returns
+    -------
+    DataFrame
+        One row per unit-cell-year: static covariates repeated across years,
+        per-year covariates varying by year, and a boolean/float ``burned``
+        response. Cells outside every unit are dropped.
+    """
+    units = units.to_crs(ANALYSIS_CRS).reset_index(drop=True)
+    if unit_id_col not in units:
+        units = units.assign(**{unit_id_col: np.arange(len(units))})
+    for col in (site_id_col, treated_col):
+        if col not in units:
+            raise ValueError(
+                f"units is missing required column {col!r}; the matching step must "
+                f"supply {treated_col!r}, {site_id_col!r} (and ideally {unit_id_col!r})."
+            )
+
+    grid = build_common_grid(units, res_m=res_m)
+
+    # --- which grid cell belongs to which unit (and its treated/site labels) ---
+    unit_ids = _rasterize_values(units, units[unit_id_col], grid)
+    treated = _rasterize_values(units, units[treated_col], grid)
+    site_ids = _rasterize_values(units, units[site_id_col].astype("category").cat.codes, grid)
+    in_unit = ~np.isnan(unit_ids)  # cells covered by some analysis unit
+
+    ys, xs = xr.broadcast(grid["y"], grid["x"])
+    base = {
+        "unit_id": unit_ids[in_unit],
+        "site_id": site_ids[in_unit],
+        "treated": treated[in_unit],
+        "y": ys.values[in_unit],
+        "x": xs.values[in_unit],
+    }
+
+    # --- static covariates (repeated across years) ---
+    if covariate_names is None:
+        covariate_names = available_covariates()
+    for name in covariate_names:
+        if name in units.columns:
+            # Already sampled upstream (matching balanced on it). Burn the
+            # per-unit value onto its cells the same way as unit_id/treated,
+            # rather than re-reading the raster -- clipping a raster to the
+            # zero-area pixel-centroid POINTs in `units` masks every pixel and
+            # would null the whole column.
+            base[name] = _rasterize_values(units, units[name], grid)[in_unit]
+            continue
+        cov = covariate_on_grid(name, grid, units)
+        if cov is None:
+            continue  # not downloaded yet -> covariates.py already warned
+        base[name] = cov.values[in_unit]
+
+    static = pd.DataFrame(base)
+
+    # Per-year (temporal) covariates: default to every layer present for all the
+    # requested years. Warped onto the same grid per year and read at in_unit
+    # cells, exactly like the static covariates and the response.
+    years = list(years)
+    if temporal_covariate_names is None:
+        temporal_covariate_names = available_temporal_covariates(years)
+    # Clip the per-year rasters to the units' bounding *box*, not to `units`
+    # itself: matched units are zero-area pixel-centroid POINTs, and clipping a
+    # raster to those points nulls every pixel (see assemble_units). The box is a
+    # real area covering the grid, so the layer loads before it is warped on-grid.
+    frame_aoi = gpd.GeoDataFrame(
+        geometry=[shapely.geometry.box(*units.total_bounds)], crs=units.crs
+    )
+
+    # --- response, per year (the swappable DV) ---
+    rows = []
+    for year in years:
+        resp = load_standardized(product, year, units)
+        if resp is None:
+            continue  # product absent for this year -> skip
+        burned = to_common_grid(resp.astype("float32"), grid, how="max")
+        year_df = static.copy()
+        year_df["year"] = year
+        year_df["burned"] = burned.values[in_unit]
+        # Per-year climate: that year's weather at each cell (keyed on x, y, year).
+        for name in temporal_covariate_names:
+            cov = temporal_covariate_on_grid(name, grid, frame_aoi, year)
+            if cov is None:
+                continue  # that year not built yet -> covariates.py already warned
+            year_df[name] = cov.values[in_unit]
+        rows.append(year_df)
+
+    if not rows:
+        raise ValueError(f"No {product} data found for years {list(years)}.")
+    frame = pd.concat(rows, ignore_index=True)
+    # burned is NaN where the product had no coverage; drop those cell-years.
+    return frame.dropna(subset=["burned"]).reset_index(drop=True)
+
+
+def add_post_treatment_indicator(
+    frame: pd.DataFrame,
+    units,
+    restoration_yr_col: str = "End_Yr",
+    unit_id_col: str = "unit_id",
+    treated_col: str = "treated",
+    year_col: str = "year",
+    post_col: str = "treated_post",
+) -> pd.DataFrame:
+    """Add a **per-year** post-restoration indicator to a :func:`build_frame` table.
+
+    ``build_frame`` burns the *static* ``treated`` label off ``units`` onto every
+    year of the panel, so a pixel inside a completed restoration site is
+    ``treated = 1`` in 2001 as well as in 2024. A levels fit on that column
+    therefore contrasts restored-site pixels with their matched controls **over
+    the whole record** -- a time-invariant site difference, not a before/after
+    restoration effect. With restorations landing in 2019-2026 and the MCD64A1
+    record starting in 2001, most ``treated = 1`` rows are *pre*-restoration, and
+    the site difference they carry is what the odds ratio on ``treated`` reports.
+
+    This attaches the timing ``build_frame`` drops: each unit's restoration year
+    (from ``units``, which :func:`peatfire.modeling.match_controls` carries
+    through) and
+
+    ``treated_post = 1`` iff the pixel is treated **and** ``year >=`` its site's
+    restoration year, else 0.
+
+    Controls -- which have no restoration year -- are 0 in every year, and a
+    treated pixel is 0 until its site is restored.
+
+    Which specification to fit
+    --------------------------
+    * ``burned ~ treated + treated_post + <covariates>`` -- the one to prefer, and
+      the logit analogue of the DiD in :mod:`peatfire.modeling.did`: ``treated``
+      absorbs the fixed restored-vs-control site difference and ``treated_post``
+      carries the change after restoration, so the two questions stop competing
+      for one coefficient.
+    * ``burned ~ treated_post + <covariates>`` -- the simple post-restoration
+      contrast. Cleaner to describe, but a site difference present before
+      restoration loads onto ``treated_post``.
+
+    In both, ``treated_post = 1`` rows are confined to the restoration years and
+    later while the reference group spans the whole record, so keep the per-year
+    weather columns (``pdsi``, ``gdd``) in the fit -- with the static ``treated``
+    they only added precision, here they adjust for the calendar years the two
+    arms no longer share. ``C(year)`` fixed effects control time far more fully;
+    with fire this rare, expect years without a single burn to trip the
+    quasi-separation guard in :func:`peatfire.modeling.fit_logit_clustered`.
+
+    Parameters
+    ----------
+    frame : DataFrame
+        Output of :func:`build_frame` (needs ``unit_id``, ``treated``, ``year``).
+    units : (Geo)DataFrame
+        The matched units ``build_frame`` consumed, carrying ``unit_id_col`` and
+        ``restoration_yr_col`` (NaN/absent on controls). ``match_controls`` keeps
+        the restoration year on its output, so this is the same object passed to
+        :func:`build_frame`.
+    restoration_yr_col : str
+        Restoration-year column on ``units`` ('End_Yr'). Copied onto the returned
+        frame, which also makes the event-time plots
+        (:func:`peatfire.modeling.plot_raw_burn_rate_by_event_time`) work off the
+        levels frame.
+    post_col : str
+        Name of the indicator to add ('treated_post').
+
+    Returns
+    -------
+    DataFrame
+        A copy of ``frame`` with ``restoration_yr_col`` and ``post_col`` added.
+
+    Raises
+    ------
+    ValueError
+        If a required column is missing, if no unit carries a restoration year,
+        or if no pixel-year is post-restoration (an all-zero indicator cannot be
+        fit -- usually ``years`` ending before the first restoration).
+    """
+    for col, where in ((unit_id_col, frame), (treated_col, frame), (year_col, frame)):
+        if col not in where.columns:
+            raise ValueError(
+                f"frame is missing {col!r}; pass the table build_frame returned "
+                f"(it carries {unit_id_col!r}, {treated_col!r} and {year_col!r})."
+            )
+    for col in (unit_id_col, restoration_yr_col):
+        if col not in units.columns:
+            raise ValueError(
+                f"units is missing {col!r}. Pass the matched units build_frame "
+                f"consumed: match_controls keeps {restoration_yr_col!r} on its "
+                "output when the pixel panel carries it."
+            )
+
+    # unit_id -> restoration year. build_frame rasterizes the unit_id *values*, so
+    # they come back as floats; match dtypes on both sides of the lookup.
+    key = pd.to_numeric(units[unit_id_col], errors="coerce").astype("float64")
+    yr = pd.to_numeric(units[restoration_yr_col], errors="coerce")
+    yr_map = pd.Series(yr.to_numpy(), index=key.to_numpy())
+    yr_map = yr_map[~yr_map.index.duplicated(keep="first")]
+    if not yr_map.notna().any():
+        raise ValueError(
+            f"no unit carries a {restoration_yr_col!r}, so no pixel-year can be "
+            "post-restoration. Restoration years are dropped when the treated "
+            "pixels are built -- check that the panel passed to match_controls "
+            f"carried {restoration_yr_col!r}."
+        )
+
+    out = frame.copy()
+    restoration_year = out[unit_id_col].astype("float64").map(yr_map)
+    out[restoration_yr_col] = restoration_year
+
+    is_treated = out[treated_col] == 1
+    out[post_col] = (
+        is_treated & restoration_year.notna() & (out[year_col] >= restoration_year)
+    ).astype(int)
+
+    missing = int((is_treated & restoration_year.isna()).sum())
+    if missing:
+        warnings.warn(
+            f"{missing} treated pixel-year(s) have no {restoration_yr_col!r} and are "
+            f"coded {post_col} = 0 in every year (never post-restoration). They stay "
+            "in the reference group; drop them if that is not what you want.",
+            stacklevel=2,
+        )
+
+    n_post = int(out[post_col].sum())
+    if n_post == 0:
+        raise ValueError(
+            f"no pixel-year is post-restoration: {post_col} is 0 everywhere and "
+            "cannot be fit. The frame's years "
+            f"({int(out[year_col].min())}-{int(out[year_col].max())}) end before the "
+            f"first restoration year ({int(yr_map.min())}) -- rebuild the frame over "
+            "years that cover the restorations."
+        )
+    print(
+        f"[post] {post_col}: {n_post} post-restoration pixel-years of "
+        f"{int(is_treated.sum())} treated ({n_post / max(int(is_treated.sum()), 1):.1%}); "
+        f"restoration years {sorted(int(v) for v in yr_map.dropna().unique())}"
+    )
+    return out
+
+
+def build_mask_frame(
+    mask: gpd.GeoDataFrame,
+    product: str = "FireCCIS311",
+    years: Iterable[int] = range(2019, 2025),
+    covariate_names: Optional[Sequence[str]] = None,
+    temporal_covariate_names: Optional[Sequence[str]] = None,
+    res_m: float = DEFAULT_RES_M,
+    all_touched: bool = True,
+    response_col: str = "burned",
+) -> pd.DataFrame:
+    """Tidy pixel-year table for **every cell in a mask** (no treated/control design).
+
+    The descriptive sibling of :func:`build_frame`. ``build_frame`` needs analysis
+    ``units`` (treated restoration polygons + matched controls) because it serves the
+    causal design; this one takes a plain **area mask** -- the NC peat AOI, a county,
+    a single site -- and returns the same shape of table for every grid cell inside
+    it. That is what the burned-area-vs-covariate pictures in
+    :mod:`peatfire.modeling.plotting` consume: they describe how fire is distributed
+    over the landscape and over the years, with no treatment contrast involved.
+
+    Everything else matches ``build_frame``: the same EPSG:5070 common grid, the same
+    swappable ``load_standardized(product, year, mask)`` response, static covariates
+    repeated across years and per-year (temporal) covariates varying by year.
+
+    Parameters
+    ----------
+    mask : GeoDataFrame
+        The area to tabulate (e.g. ``nc_peatlands_80_histosol_aoi.gpkg``). Cells are
+        kept where a mask polygon covers them; with ``all_touched`` (default) a cell
+        touched by any part of a polygon is kept, the toolkit's usual convention.
+    product : str
+        Registered **burned-area** fire product supplying the response. Point
+        (``"occurrence"``) products are rejected -- they have no per-cell burned
+        mask to aggregate.
+    years : iterable of int
+        Years to stack; a year the product does not cover is skipped.
+    covariate_names, temporal_covariate_names : sequence of str, optional
+        Static / per-year covariates to attach. Default to everything on disk
+        (:func:`available_covariates`, :func:`available_temporal_covariates`).
+    res_m : float
+        Grid resolution in metres (default = FireCCIS311 native ~300 m). Sets the
+        per-cell area, so it sets what one burned cell contributes in hectares.
+
+    Returns
+    -------
+    DataFrame
+        One row per (cell, year): ``x``, ``y``, ``year``, the covariate columns,
+        ``burned`` (the response; 1/0 for a burned-area product), and a constant
+        ``pixel_area_ha`` so a burned-area total is ``sum(burned * pixel_area_ha)``.
+        Cell-years the product does not cover are dropped.
+    """
+    if get_spec(product).family == "occurrence":
+        raise ValueError(
+            f"{product!r} is a point (occurrence) product with no per-cell burned "
+            "mask; pass a burned_area (or severity) product."
+        )
+    mask = mask.to_crs(ANALYSIS_CRS)
+    grid = build_common_grid(mask, res_m=res_m)
+
+    # Which grid cells fall inside the mask (the analogue of build_frame's in_unit).
+    inside = rasterize_polygons_to_grid(mask, grid, all_touched=all_touched).values > 0
+    if not inside.any():
+        raise ValueError(
+            f"mask covers no cells at res_m={res_m}; check the mask geometry/CRS."
+        )
+
+    ys, xs = xr.broadcast(grid["y"], grid["x"])
+    base = {"y": ys.values[inside], "x": xs.values[inside]}
+
+    # --- static covariates (repeated across years) ---
+    if covariate_names is None:
+        covariate_names = available_covariates()
+    for name in covariate_names:
+        cov = covariate_on_grid(name, grid, mask)
+        if cov is None:
+            continue  # not downloaded yet -> covariates.py already warned
+        base[name] = cov.values[inside]
+    static = pd.DataFrame(base)
+
+    years = list(years)
+    if temporal_covariate_names is None:
+        temporal_covariate_names = available_temporal_covariates(years)
+
+    # --- response + per-year covariates, one block per year ---
+    rows = []
+    for year in years:
+        resp = load_standardized(product, year, mask)
+        if resp is None:
+            continue  # product absent for this year -> skip
+        burned = to_common_grid(resp.astype("float32"), grid, how="max")
+        year_df = static.copy()
+        year_df["year"] = year
+        year_df[response_col] = burned.values[inside]
+        for name in temporal_covariate_names:
+            cov = temporal_covariate_on_grid(name, grid, mask, year)
+            if cov is None:
+                continue  # that year not built yet -> covariates.py already warned
+            year_df[name] = cov.values[inside]
+        rows.append(year_df)
+
+    if not rows:
+        raise ValueError(f"No {product} data found for years {years}.")
+    frame = pd.concat(rows, ignore_index=True)
+    # Constant cell area, so burned *area* is a plain weighted sum downstream.
+    frame["pixel_area_ha"] = float(res_m) ** 2 / 1e4
+    return frame.dropna(subset=[response_col]).reset_index(drop=True)
+
+
+def attach_fire_response(
+    points,
+    aoi: gpd.GeoDataFrame,
+    product: str = "FireCCIS311",
+    res_m: float = DEFAULT_RES_M,
+    year_col: str = "year",
+    response_col: str = "burned",
+):
+    """Sample the per-year fire response at pixel points.
+
+    The pixel-panel analogue of :func:`build_frame`'s response step: where
+    ``build_frame`` rasterizes unit *polygons* and reads the response on the
+    cells they cover, this reads the same swappable ``load_standardized(product,
+    year, aoi)`` layer at existing pixel **points** -- one value per
+    ``(x, y, year)`` row of a panel such as the output of
+    :func:`peatfire.modeling.get_treated_and_control_pixels`.
+
+    Parameters
+    ----------
+    points : (Geo)DataFrame
+        Pixel-year panel carrying ``x``, ``y`` (EPSG:5070 cell centres) and
+        ``year_col``. Returned copy is the same object with ``response_col``
+        added; the input is not mutated.
+    aoi : GeoDataFrame
+        Area the product is clipped to (and the extent of the sampling grid).
+    product : str
+        Registered fire product supplying the response; swap for a severity
+        product to sample severity instead.
+    res_m : float
+        Grid resolution in metres (default = FireCCIS311 native ~300 m). Use the
+        same value the panel's pixels were laid out on so ``sel(method=
+        "nearest")`` lands on the intended cell.
+
+    Returns
+    -------
+    Same type as ``points``, with ``response_col`` filled per pixel-year.
+    Years the product does not cover are left NaN (callers decide whether to
+    drop them; :func:`peatfire.modeling.did.build_panel` drops them itself).
+    """
+    grid = build_common_grid(aoi, res_m=res_m)
+
+    out = points.copy()
+    out[response_col] = np.nan
+    for year, idx in out.groupby(year_col).groups.items():
+        resp = load_standardized(product, int(year), aoi)
+        if resp is None:  # product missing this year -> leave NaN
+            continue
+        burned = to_common_grid(resp.astype("float32"), grid, how="max")
+        sub = out.loc[idx]
+        xi = xr.DataArray(sub["x"].values, dims="point")
+        yi = xr.DataArray(sub["y"].values, dims="point")
+        out.loc[idx, response_col] = burned.sel(x=xi, y=yi, method="nearest").values
+    return out

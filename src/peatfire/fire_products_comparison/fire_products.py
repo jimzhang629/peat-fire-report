@@ -1,0 +1,541 @@
+"""Per-product knowledge and standardized loaders for fire data products.
+
+This is the *data layer* of the fire-product comparison toolkit. It isolates the
+messy, product-specific details -- where each product lives on disk, its native
+CRS and resolution, how a "burned" pixel is encoded, and whether it is delivered
+monthly or annually -- behind a small registry of :class:`ProductSpec` objects
+and a handful of generic loaders.
+
+Downstream code (:mod:`peatfire.fire_comparison`) never needs to know these
+details: it asks for ``load_standardized(product, year, aoi)`` and gets back a
+standardized representation (an annual boolean burned mask, a continuous
+severity grid, or a points GeoDataFrame).
+
+Adding a new product is a matter of adding one :class:`ProductSpec` to
+:data:`FIRE_PRODUCTS`; no loader code changes.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+import geopandas as gpd
+import rioxarray  # noqa: F401  (registers the .rio accessor)
+import xarray as xr
+
+from ..preproc.data_loading import (
+    clip_raster_to_mask,
+    clip_vector_to_mask,
+    data_path,
+)
+
+
+# ---------------------------------------------------------------------------
+# Product specification
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProductSpec:
+    """Everything the generic loaders need to read one fire product.
+
+    Parameters
+    ----------
+    name : str
+        Short identifier, e.g. ``"MCD64A1"``. Used as the registry key and as
+        the column/label name in outputs.
+    family : str
+        One of ``"burned_area"``, ``"severity"``, ``"occurrence"``. Drives which
+        loader :func:`load_standardized` dispatches to and which comparison a
+        product participates in.
+    kind : str
+        ``"raster"`` or ``"vector"``.
+    native_res_m : float
+        Nominal pixel size in metres (used only for documentation / sensitivity
+        analysis; areas are computed from the actual affine transform).
+    temporal : str
+        ``"monthly"``, ``"annual"`` or ``"events"`` -- controls how files are
+        grouped into a single year.
+    root_parts : tuple of str
+        Arguments forwarded to :func:`peatfire.data_path` to locate the
+        product's directory, e.g. ``("processed", "fire", "MCD64A1_061")``.
+    glob : str
+        Filename glob within that directory, e.g. ``"MCD64A1_*_nc.tif"``.
+    year_parser : callable, optional
+        ``Path -> int`` mapping a file to its year. Required for raster products
+        whose year is encoded in the filename. ``None`` for vector products that
+        are filtered by a date column instead.
+    month_parser : callable, optional
+        ``Path -> int`` (1-12) mapping a file to its calendar month. Set this for
+        ``"monthly"`` products to enable monthly-resolution comparison. Leave it
+        ``None`` for annual-only products -- they are then automatically dropped
+        from monthly mode (a month filter on them yields no files).
+    burn_predicate : callable, optional
+        ``DataArray -> boolean DataArray`` marking burned pixels. Required for
+        ``burned_area`` rasters.
+    value_predicate : callable, optional
+        ``DataArray -> float DataArray`` extracting the continuous severity
+        metric (e.g. dNBR, CBI). Required for ``severity`` products.
+    date_field : str, optional
+        For vector ``occurrence`` products, the attribute holding the
+        acquisition date (used to filter to a year).
+    frp_field : str, optional
+        For vector ``occurrence`` products, the Fire Radiative Power column.
+    band : int, optional
+        1-based band to select from a multi-band raster before applying the
+        burn/value predicate (e.g. FireCCI51 exports a 4-band stack whose first
+        band is ``BurnDate``). ``None`` (the default) means the file is
+        single-band and the lone band is squeezed out.
+    nodata : tuple of float, optional
+        Sentinel fill value(s) to set to ``NaN`` after reading, for files whose
+        nodata is *not* declared in the GeoTIFF (so ``masked=True`` misses it),
+        e.g. MOSEV's int16 ``(32767, -32767)`` fill or SE_FireMap's ``999``.
+        Leave ``None`` when the file declares its nodata correctly.
+    resample : str, optional
+        How to aggregate this product when warping continuous values onto the
+        common grid: ``None`` (default) uses area ``"mean"`` -- right for
+        continuous severity (CBI, dNBR). Set ``"mode"`` (majority) for
+        categorical/ordinal layers like MTBS classes so a coarse cell keeps a
+        valid class instead of a meaningless fractional average. (Binary masks
+        always use ``"max"`` regardless.)
+    native_crs : str, optional
+        Documentation only; the actual CRS is read from each file.
+    """
+
+    name: str
+    family: str
+    kind: str
+    native_res_m: float
+    temporal: str
+    root_parts: tuple
+    glob: str
+    year_parser: Optional[Callable[[Path], int]] = None
+    month_parser: Optional[Callable[[Path], int]] = None
+    burn_predicate: Optional[Callable[[xr.DataArray], xr.DataArray]] = None
+    value_predicate: Optional[Callable[[xr.DataArray], xr.DataArray]] = None
+    date_field: Optional[str] = None
+    frp_field: Optional[str] = None
+    band: Optional[int] = None
+    nodata: Optional[tuple] = None
+    resample: Optional[str] = None
+    native_crs: Optional[str] = None
+
+    @property
+    def directory(self) -> Path:
+        return data_path(*self.root_parts)
+
+
+# ---------------------------------------------------------------------------
+# Filename year parsers (kept tiny and named so specs read clearly)
+# ---------------------------------------------------------------------------
+def _modis_a_year(p: Path) -> int:
+    # MODIS-style 'A<YYYYDDD>' token: 'MCD64A1_A2017001_nc' -> 2017,
+    # 'MOSEV_A2001001_nc' -> 2001.
+    return int(p.stem.split("_")[1][1:5])
+
+
+def _gabam_year(p: Path) -> int:
+    # 'gabam_2011_nc' -> 2011
+    return int(p.stem.split("_")[1])
+
+
+def _second_token_year(p: Path) -> int:
+    # '<prod>_<year>_...' e.g. 'firecci51_2001_01_nc' -> 2001
+    return int(p.stem.split("_")[1])
+
+
+def _third_token_year(p: Path) -> int:
+    # '<a>_<b>_<year>_...' e.g. 'cbi_mosaic_2001_nc' -> 2001,
+    # 'mtbs_NC_2001' -> 2001, 'fireccis311_JD_2019_01_nc' -> 2019.
+    return int(p.stem.split("_")[2])
+
+
+# ---------------------------------------------------------------------------
+# Filename month parsers (1-12). Only monthly products need one.
+# ---------------------------------------------------------------------------
+def _modis_a_month(p: Path) -> int:
+    # MODIS 'A<YYYYDDD>' encodes year + day-of-year, NOT a month number, so the
+    # month is derived from the day-of-year: 'MCD64A1_A2017032_nc' -> Feb -> 2,
+    # 'MOSEV_A2001001_nc' -> Jan -> 1.
+    from datetime import date, timedelta
+
+    tok = p.stem.split("_")[1]            # 'A2017032'
+    year, doy = int(tok[1:5]), int(tok[5:8])
+    return (date(year, 1, 1) + timedelta(days=doy - 1)).month
+
+
+def _second_token_month(p: Path) -> int:
+    # '<prod>_<year>_<MM>_...' e.g. 'firecci51_2001_01_nc' -> 1
+    return int(p.stem.split("_")[2])
+
+
+def _fourth_token_month(p: Path) -> int:
+    # '<a>_<b>_<year>_<MM>_...' e.g. 'fireccis311_JD_2019_01_nc' -> 1
+    return int(p.stem.split("_")[3])
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+# Paths, globs and filename year-parsers below match the layout documented in
+# ``metadata``/``data_inventory.csv``. Products that are downloaded but whose
+# pixel *encoding* still needs confirming are flagged ``CONFIRM BAND``; products
+# not yet downloaded skip gracefully via ``_files_for_year``.
+FIRE_PRODUCTS: dict[str, ProductSpec] = {
+    "MCD64A1": ProductSpec(
+        name="MCD64A1",
+        family="burned_area",
+        kind="raster",
+        native_res_m=500.0,
+        temporal="monthly",
+        # processed monthly tifs: data/processed/fire/MCD64A1_061/MCD64A1_A2017001_nc.tif
+        root_parts=("processed", "fire", "MCD64A1_061"),
+        glob="MCD64A1_*_nc.tif",
+        year_parser=_modis_a_year,
+        month_parser=_modis_a_month,
+        # BurnDate is day-of-year 1-366 for burned pixels; 0/-1/-2/NaN unburned.
+        burn_predicate=lambda da: da > 0,
+        native_crs="Sinusoidal (SR-ORG:6974)",
+    ),
+    "GABAM": ProductSpec(
+        name="GABAM",
+        family="burned_area",
+        kind="raster",
+        native_res_m=30.0,
+        temporal="annual",
+        # download_and_clip_data.ipynb clips GABAM to
+        # data/processed/fire/gabam/gabam_{YYYY}_nc.tif.
+        root_parts=("processed", "fire", "gabam"),
+        glob="gabam_*_nc.tif",
+        year_parser=_gabam_year,
+        burn_predicate=lambda da: da == 1,
+        native_crs="EPSG:4326",
+    ),
+    "FireCCI51": ProductSpec(
+        name="FireCCI51",
+        family="burned_area",
+        kind="raster",
+        native_res_m=250.0,
+        temporal="monthly",
+        # download_and_clip_data.ipynb writes FireCCI51 to a firecci51/ sub-folder:
+        # data/processed/fire/firecci51/firecci51_{YYYY}_{MM}_nc.tif.
+        root_parts=("processed", "fire", "firecci51"),
+        glob="firecci51_*_nc.tif",
+        year_parser=_second_token_year,
+        month_parser=_second_token_month,
+        # GEE export is a 4-band stack (BurnDate, ConfidenceLevel, LandCover,
+        # ObservedFlag); band 1 = BurnDate, 1-366 burned, 0 unburned, -1/-2 unobserved.
+        band=1,
+        burn_predicate=lambda da: da > 0,
+        native_crs="EPSG:4326",
+    ),
+    "FireCCIS311": ProductSpec(
+        name="FireCCIS311",
+        family="burned_area",
+        kind="raster",
+        native_res_m=300.0,
+        temporal="monthly",
+        # inventory: data/processed/fire/fireccis311/{layer}/fireccis311_{layer}_{YYYY}_{MM}_nc.tif
+        # JD = burn date layer (CL=confidence, LC=land cover are the other layers).
+        root_parts=("processed", "fire", "fireccis311", "JD"),
+        glob="fireccis311_JD_*_nc.tif",
+        year_parser=_third_token_year,
+        month_parser=_fourth_token_month,
+        burn_predicate=lambda da: da > 0,  # JD burn date > 0 = burned
+        native_crs="EPSG:4326",  # short record: 2019-2024 only
+    ),
+    "VIIRS": ProductSpec(
+        name="VIIRS",
+        family="occurrence",
+        kind="vector",
+        native_res_m=375.0,
+        temporal="events",
+        # S-NPP archive is the long record (2012-present). noaa20/noaa21 NRT
+        # gpkgs also exist in this folder and can be added as separate specs.
+        root_parts=("processed", "fire", "viirs"),
+        glob="viirs_snpp_archive_nc.gpkg",
+        date_field="ACQ_DATE",
+        frp_field="FRP",
+        native_crs="EPSG:4326",
+    ),
+    "SE_FireMap": ProductSpec(
+        name="SE_FireMap",
+        family="severity",
+        kind="raster",
+        native_res_m=30.0,
+        temporal="annual",
+        # notebook clips to a per-year SUB-FOLDER:
+        # data/processed/fire/se_firemap/cbi_mosaic_{YYYY}_nc/cbi_mosaic_{YYYY}_nc.tif
+        # USGS SE FireMap = gradient-boosted model predicting CBI burn severity
+        # (0-3) over Landsat burned area, annual 2000-2022.
+        root_parts=("processed", "fire", "se_firemap"),
+        glob="cbi_mosaic_*_nc/cbi_mosaic_*_nc.tif",
+        year_parser=_third_token_year,
+        # 999 is an undeclared fill sentinel (masked=True misses it); null it.
+        nodata=(999,),
+        # docs say CBI 0-3 but the raster stores CBI x100 (valid max ~193 in NC ->
+        # CBI ~1.9), so divide to recover true CBI units. CONFIRM /100 puts the
+        # map in 0-3. (Scaling does not affect the rank-based Spearman agreement.)
+        value_predicate=lambda da: da / 100.0,
+        native_crs="EPSG:5070",
+    ),
+    "MOSEV": ProductSpec(
+        name="MOSEV",
+        family="severity",
+        kind="raster",
+        native_res_m=500.0,
+        temporal="monthly",
+        # inventory: data/processed/fire/mosev/MOSEV_A{YYYYDDD}_nc.tif
+        root_parts=("processed", "fire", "mosev"),
+        glob="MOSEV_*_nc.tif",
+        year_parser=_modis_a_year,
+        month_parser=_modis_a_month,
+        # processed tifs keep all 7 MOSEV bands (1 dNBR, 2 RdNBR, 3 pre-NBR,
+        # 4 post-NBR, 5 pre-date, 6 post-date, 7 MCD64A1 burn date); band 1 = dNBR.
+        band=1,
+        # int16 +/-32767 fill is undeclared; null it (real dNBR is ~ +/-1300,
+        # typically scaled x1000 -- CONFIRM scaling before trusting magnitudes).
+        nodata=(32767, -32767),
+        value_predicate=lambda da: da,
+        native_crs="Sinusoidal",
+    ),
+    "MTBS": ProductSpec(
+        name="MTBS",
+        family="severity",
+        kind="raster",
+        native_res_m=30.0,
+        temporal="annual",
+        # data/processed/fire/mtbs/mtbs_NC_{YYYY}/mtbs_NC_{YYYY}.tif (loaders clip in-memory)
+        root_parts=("processed", "fire", "mtbs"),
+        glob="mtbs_NC_*/mtbs_NC_*.tif",
+        year_parser=_third_token_year,
+        # MTBS thematic severity classes: 1 unburned-low, 2 low, 3 moderate,
+        # 4 high, 5 increased greenness, 6 non-mapping area. Class 6 is a mask,
+        # not a severity level -- null it so it cannot be ranked as "most severe".
+        # (Class 5 "increased greenness" is left in; drop it too if undesired.)
+        nodata=(6,),
+        # "mode" = majority class when coarsening, so cells stay valid classes
+        # rather than fractional averages. Confirm class handling before trusting
+        # Spearman against continuous CBI/dNBR.
+        resample="mode",
+        value_predicate=lambda da: da,
+        native_crs="EPSG:5070",
+    ),
+    # # ---- not yet downloaded: skips gracefully until the data lands ----
+    # "USGS_BA": ProductSpec(
+    #     name="USGS_BA",
+    #     family="burned_area",
+    #     kind="raster",
+    #     native_res_m=30.0,
+    #     temporal="annual",
+    #     root_parts=("processed", "fire", "usgs_lba"),
+    #     glob="usgs_lba_*_nc.tif",  # TODO confirm when downloaded
+    #     year_parser=_second_token_year,
+    #     burn_predicate=lambda da: da > 0,
+    #     native_crs="EPSG:5070",
+    # ),
+}
+
+
+def get_spec(product: str) -> ProductSpec:
+    """Return the :class:`ProductSpec` for ``product`` (clear error if unknown)."""
+    try:
+        return FIRE_PRODUCTS[product]
+    except KeyError:
+        raise KeyError(
+            f"Unknown product {product!r}. Registered products: "
+            f"{sorted(FIRE_PRODUCTS)}"
+        )
+
+
+def list_products(family: Optional[str] = None) -> list[str]:
+    """List registered product names, optionally filtered by ``family``."""
+    return [
+        name
+        for name, spec in FIRE_PRODUCTS.items()
+        if family is None or spec.family == family
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Clipping
+#
+# We reuse the project's clip helpers from preproc.data_loading -- the no-save
+# variants, which clip in memory (we do not want a disk write per product/year).
+# Rasters are squeezed to 2D (drop the singleton band) so the burn/value
+# predicates and the common-grid step work on (y, x) arrays.
+# ---------------------------------------------------------------------------
+def _clip_raster(
+    path: Path,
+    aoi: gpd.GeoDataFrame,
+    band: Optional[int] = None,
+    nodata: Optional[tuple] = None,
+) -> xr.DataArray:
+    da = clip_raster_to_mask(path, aoi)
+    if band is not None:
+        # multi-band file (e.g. FireCCI51's BurnDate/ConfidenceLevel/...): pick
+        # the requested 1-based band and drop the band coordinate.
+        da = da.sel(band=band, drop=True)
+        # rioxarray keeps ``long_name`` as the *whole* per-band tuple, so the
+        # slice still carries every band's name and xarray auto-labels plots
+        # (e.g. MOSEV's colourbar) with the wrong one. Prune it to the band kept.
+        ln = da.attrs.get("long_name")
+        if isinstance(ln, (list, tuple)) and len(ln) >= band:
+            da.attrs["long_name"] = ln[band - 1]
+    else:
+        da = da.squeeze("band", drop=True)
+    if nodata is not None:
+        # null undeclared fill sentinels masked=True can't catch (e.g. MOSEV's
+        # int16 +/-32767, SE_FireMap's 999) so they don't pollute area/severity.
+        da = da.where(~da.isin(list(nodata)))
+    return da
+
+
+def _clip_vector(path: Path, aoi: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    return clip_vector_to_mask(path, aoi)
+
+
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+def _files_for_period(
+    spec: ProductSpec, year: int, month: Optional[int] = None
+) -> list[Path]:
+    """Return the file(s) for ``spec`` in a year, or a single month if given.
+
+    ``month=None`` keeps the original annual behaviour (all of the year's files).
+    If ``month`` is given but the product has no ``month_parser`` (i.e. it is
+    annual-only), the result is empty -- which is how annual-only products get
+    dropped from monthly mode.
+
+    A missing directory or empty result is *not* an error: the product is simply
+    skipped with a warning, so a comparison can run on whatever is downloaded.
+    """
+    if not spec.directory.exists():
+        warnings.warn(
+            f"{spec.name}: directory {spec.directory} does not exist -- skipping.",
+            stacklevel=2,
+        )
+        return []
+    files = sorted(spec.directory.glob(spec.glob))
+    if spec.year_parser is None:
+        return files  # vector products are filtered by date later
+    files = [f for f in files if spec.year_parser(f) == year]
+    if month is not None:
+        if spec.month_parser is None:
+            return []  # annual-only product -> not available at monthly resolution
+        files = [f for f in files if spec.month_parser(f) == month]
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Standardized loaders
+# ---------------------------------------------------------------------------
+def load_binary_annual(
+    product: str, year: int, aoi: gpd.GeoDataFrame, month: Optional[int] = None
+) -> Optional[xr.DataArray]:
+    """Boolean burned mask (``True`` = burned) for one product/year (or month).
+
+    With ``month=None`` (default) all of the year's files are OR'd into a single
+    annual mask (a pixel that burned in *any* month counts as burned). With ``month`` set, only that month's file(s) are
+    loaded (and OR'd, if a month has more than one). The result is clipped to
+    ``aoi`` with its native CRS preserved.
+
+    Returns ``None`` if the product has no data for the period (caller skips it).
+    """
+    spec = get_spec(product)
+    if spec.burn_predicate is None:
+        raise ValueError(f"{product} has no burn_predicate (not a burned-area product).")
+
+    files = _files_for_period(spec, year, month)
+    if not files:
+        return None
+
+    masks = []
+    for f in files:
+        clipped = _clip_raster(f, aoi, spec.band, spec.nodata)
+        masks.append(spec.burn_predicate(clipped))
+
+    if len(masks) == 1:
+        annual = masks[0]
+    else:
+        annual = xr.concat(masks, dim="month").max("month")
+    annual = annual.rio.write_crs(masks[0].rio.crs)
+    annual.name = product
+    return annual
+
+
+def load_continuous_annual(
+    product: str, year: int, aoi: gpd.GeoDataFrame, month: Optional[int] = None
+) -> Optional[xr.DataArray]:
+    """Continuous severity grid (e.g. CBI / dNBR) for one product/year (or month).
+
+    With ``month=None`` the year's files are aggregated by per-pixel maximum;
+    with ``month`` set, only that month is loaded. Returns ``None`` if there is no
+    data for the period.
+    """
+    spec = get_spec(product)
+    if spec.value_predicate is None:
+        raise ValueError(f"{product} has no value_predicate (not a severity product).")
+
+    files = _files_for_period(spec, year, month)
+    if not files:
+        return None
+
+    vals = [
+        spec.value_predicate(_clip_raster(f, aoi, spec.band, spec.nodata))
+        for f in files
+    ]
+    if len(vals) == 1:
+        annual = vals[0]
+    else:
+        annual = xr.concat(vals, dim="month").max("month")
+    annual = annual.rio.write_crs(vals[0].rio.crs)
+    annual.name = product
+    return annual
+
+
+def load_points(
+    product: str, year: int, aoi: gpd.GeoDataFrame, month: Optional[int] = None
+) -> Optional[gpd.GeoDataFrame]:
+    """Active-fire point detections (with FRP) for one product/year (or month).
+
+    The whole clipped layer is read, then filtered to ``year`` (and ``month`` if
+    given) using ``spec.date_field``. Returns ``None`` if the file is absent or
+    no detections fall in the period.
+    """
+    spec = get_spec(product)
+    files = _files_for_period(spec, year)
+    if not files:
+        return None
+
+    gdf = _clip_vector(files[0], aoi)
+    if spec.date_field and spec.date_field in gdf.columns:
+        dates = gpd.pd.to_datetime(gdf[spec.date_field], errors="coerce")
+        keep = dates.dt.year == year
+        if month is not None:
+            keep &= dates.dt.month == month
+        gdf = gdf[keep]
+    if gdf.empty:
+        return None
+    return gdf
+
+
+def load_standardized(
+    product: str, year: int, aoi: gpd.GeoDataFrame, month: Optional[int] = None
+):
+    """Dispatch to the right loader based on the product's ``family``.
+
+    Passes ``month`` through so callers can request a single month. Returns a
+    boolean mask (burned_area), a continuous grid (severity), a points
+    GeoDataFrame (occurrence), or ``None`` when data is absent.
+    """
+    spec = get_spec(product)
+    if spec.family == "burned_area":
+        return load_binary_annual(product, year, aoi, month)
+    if spec.family == "severity":
+        return load_continuous_annual(product, year, aoi, month)
+    if spec.family == "occurrence":
+        return load_points(product, year, aoi, month)
+    raise ValueError(f"Unknown family {spec.family!r} for product {product!r}.")

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "peat_fire_stanback"
+version = "0.1.0"
+description = "Wildfire risk and peatland restoration analysis for North Carolina peatlands."
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+]
+
+[project.optional-dependencies]
+# Readers for the R serialisations (.Rds/.RData) the climate pipeline ingests.
+# pyreadr (librdata) is fast but cannot parse the project's sf geometry
+# list-columns / ALTREP vectors; rdata is the pure-Python fallback that can.
+rdata = [
+    "pyreadr",
+    "rdata",
+]
+
+# Conventional "src layout": the importable package is `peatfire`, which lives
+# in src/peatfire/. setuptools discovers it under src/ and exposes it as
+# `import peatfire` (the src/ directory itself is not importable).
+[tool.setuptools.packages.find]
+where = ["src"]

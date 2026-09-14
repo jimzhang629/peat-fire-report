@@ -1,0 +1,225 @@
+"""Modeling pipeline: peat condition -> fire.
+
+Turns the chosen fire product (FireCCIS311) plus environmental covariates and
+peat condition/restoration/management into a tidy pixel-year frame and fitted
+models. See ``modeling_notebook_explained.md`` for the design.
+
+Three layers, mirroring the fire-comparison toolkit:
+
+* :mod:`covariates` -- a ``CovariateSpec`` registry + standardized loaders that
+  warp each environmental layer onto the shared EPSG:5070 grid.
+* :mod:`frame` -- assembles the tidy ``[unit, year, covariates..., burned]``
+  table from an upstream-matched set of treated + control units.
+* :mod:`models` -- cluster-robust / mixed logistic fits, reported as odds ratios.
+* :mod:`did` -- staggered difference-in-differences (Callaway & Sant'Anna, as in
+  Castro et al. 2026): match, then identify off the pre/post change so
+  time-invariant confounders difference out. An alternative estimator on the same
+  ``build_frame`` output.
+
+The upstream **matching** step (choosing control pixels for each restoration
+site) is deliberately left out of this package so the causal design stays
+explicit; ``build_frame`` consumes its output.
+"""
+
+from .covariates import (
+    COVARIATES,
+    TEMPORAL_COVARIATES,
+    CovariateSpec,
+    available_covariates,
+    available_temporal_covariates,
+    covariate_on_grid,
+    get_covariate,
+    get_temporal_covariate,
+    list_covariates,
+    list_temporal_covariates,
+    load_covariate,
+    load_temporal_covariate,
+    temporal_covariate_on_grid,
+)
+from .frame import (
+    add_post_treatment_indicator,
+    attach_fire_response,
+    build_frame,
+    build_mask_frame,
+    load_completed_restoration_sites_in_analysis_crs,
+    load_restoration_sites,
+)
+from .models import (
+    coefficients,
+    drainage_effect_table,
+    fit_drainage_models,
+    fit_logit_clustered,
+    fit_mixed_logit,
+    fit_ols_clustered,
+    odds_ratios,
+)
+from .did import (  # staggered DiD alternative (Castro et al. 2026)
+    CLUSTER_LEVELS,
+    add_fire_lags,
+    aggregate_att,
+    att_collapsed,
+    attach_cohort,
+    avoided_area,
+    build_panel,
+    estimate_att,
+    fit_att,
+    panel_support_table,
+    prepare_panel,
+    restrict_panel_to_matched,
+    restrict_to_supported_cohorts,
+)
+
+from .climate import (  # GHCN station points -> gridded climate covariates
+    build_annual_climate,
+    build_climate_normals,
+    idw_to_grid,
+    load_ghcn_stations,
+    station_normals,
+    write_annual_climate,
+    write_climate_normals,
+)
+from .soil import (  # SSURGO soil polygons -> gridded soil covariates
+    build_soil_rasters,
+    build_soil_database_rasters,
+    inspect_soil_columns,
+    mukey_attribute,
+)
+from .plotting import (  # step-by-step data-inspection diagnostics
+    BURNED_AREA_PLOT_KINDS,
+    plot_annual_burned_area_vs_covariate,
+    plot_burned_area_and_covariate_by_year,
+    plot_burned_area_covariate_heatmap,
+    plot_burned_area_vs_covariate,
+    plot_burned_area_vs_covariates_over_years,
+    plot_candidate_control_pixels,
+    plot_covariate_maps,
+    plot_covariate_pairs,
+    plot_covariate_space,
+    plot_covariate_vs_burn,
+    plot_covariates_vs_burn,
+    plot_event_study,
+    plot_matched_pairs_covariate,
+    plot_matched_pairs_geographic,
+    plot_prognostic_trajectory,
+    plot_raw_burn_rate_by_event_time,
+    plot_raw_burn_rate_by_year,
+    plot_score_map,
+    plot_score_overlap,
+    plot_temporal_covariate_by_year,
+    plot_burn_rate_by_site
+)
+from .matching import (  # assignment scaffold (Part A stubs) + test harness (Part B)
+    add_matching_scores,
+    add_prognostic_score_series,
+    add_propensity_score_series,
+    match_controls_event_time,
+    assemble_units,
+    attach_covariates,
+    balance_table,
+    build_candidate_pool,
+    check_balance,
+    check_candidate_pool,
+    check_covariates,
+    check_matches,
+    check_pixels,
+    check_treated_units,
+    load_treated_units,
+    match_controls,
+    pixelate,
+    plot_balance,
+    standardized_mean_diff,
+)
+
+__all__ = [
+    "COVARIATES",
+    "TEMPORAL_COVARIATES",
+    "CovariateSpec",
+    "available_covariates",
+    "available_temporal_covariates",
+    "covariate_on_grid",
+    "get_covariate",
+    "get_temporal_covariate",
+    "list_covariates",
+    "list_temporal_covariates",
+    "load_covariate",
+    "load_temporal_covariate",
+    "temporal_covariate_on_grid",
+    "add_post_treatment_indicator",
+    "attach_fire_response",
+    "build_frame",
+    "build_mask_frame",
+    "load_completed_restoration_sites_in_analysis_crs",
+    "load_restoration_sites",
+    "build_annual_climate",
+    "build_climate_normals",
+    "idw_to_grid",
+    "load_ghcn_stations",
+    "station_normals",
+    "write_annual_climate",
+    "write_climate_normals",
+    "build_soil_rasters",
+    "build_soil_database_rasters",
+    "inspect_soil_columns",
+    "mukey_attribute",
+    "BURNED_AREA_PLOT_KINDS",
+    "plot_annual_burned_area_vs_covariate",
+    "plot_burned_area_and_covariate_by_year",
+    "plot_burned_area_covariate_heatmap",
+    "plot_burned_area_vs_covariate",
+    "plot_burned_area_vs_covariates_over_years",
+    "plot_candidate_control_pixels",
+    "plot_covariate_maps",
+    "plot_covariate_pairs",
+    "plot_covariate_space",
+    "plot_covariate_vs_burn",
+    "plot_covariates_vs_burn",
+    "plot_event_study",
+    "plot_matched_pairs_covariate",
+    "plot_matched_pairs_geographic",
+    "plot_prognostic_trajectory",
+    "plot_raw_burn_rate_by_event_time",
+    "plot_raw_burn_rate_by_year",
+    "plot_burn_rate_by_site",
+    "plot_score_map",
+    "plot_score_overlap",
+    "plot_temporal_covariate_by_year",
+    "coefficients",
+    "drainage_effect_table",
+    "fit_drainage_models",
+    "fit_logit_clustered",
+    "fit_mixed_logit",
+    "fit_ols_clustered",
+    "odds_ratios",
+    "CLUSTER_LEVELS",
+    "add_fire_lags",
+    "aggregate_att",
+    "att_collapsed",
+    "attach_cohort",
+    "avoided_area",
+    "build_panel",
+    "estimate_att",
+    "fit_att",
+    "prepare_panel",
+    "restrict_panel_to_matched",
+    "restrict_to_supported_cohorts",
+    "panel_support_table",
+    "add_matching_scores",
+    "add_prognostic_score_series",
+    "add_propensity_score_series",
+    "match_controls_event_time",
+    "assemble_units",
+    "attach_covariates",
+    "balance_table",
+    "build_candidate_pool",
+    "check_balance",
+    "check_candidate_pool",
+    "check_covariates",
+    "check_matches",
+    "check_pixels",
+    "check_treated_units",
+    "load_treated_units",
+    "match_controls",
+    "pixelate",
+    "plot_balance",
+    "standardized_mean_diff",
+]
