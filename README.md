@@ -42,9 +42,6 @@ without `sys.path` hacks or having to launch Jupyter from the repo root:
 pip install -e .
 ```
 
-If you have an old install of this project, uninstall it first so the import
-name updates cleanly: `pip uninstall peat-fire-stanback nc-peatland-fire`.
-
 ## Importing from `peatfire` and loading data
 
 After the editable install, import the package and its data helpers from any
